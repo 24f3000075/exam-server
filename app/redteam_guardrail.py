@@ -1,7 +1,7 @@
 import ipaddress
 import os
 import socket
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urljoin
 
 import requests
 from fastapi import APIRouter
@@ -24,10 +24,21 @@ def _is_private_ip(ip_str: str) -> bool:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return True  # unparsable -> treat as unsafe
+
+    # Unwrap IPv4-mapped / IPv4-compatible IPv6 addresses (e.g. ::ffff:127.0.0.1)
+    # so the underlying IPv4 address is also checked, not just the wrapper.
+    if isinstance(ip, ipaddress.IPv6Address):
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None and _is_private_ip(str(mapped)):
+            return True
+        sixtofour = getattr(ip, "sixtofour", None)
+        if sixtofour is not None and _is_private_ip(str(sixtofour)):
+            return True
+
     if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
         return True
-    # AWS/GCP/Azure metadata endpoint
-    if str(ip) == "169.254.169.254":
+    # AWS/GCP/Azure metadata endpoints (v4 and v6)
+    if str(ip) in ("169.254.169.254", "fd00:ec2::254"):
         return True
     return False
 
@@ -108,13 +119,21 @@ def _safe_fetch_url(url: str):
             location = resp.headers.get("Location")
             if not location:
                 return False, None, "redirect with no Location"
-            next_parts = urlsplit(location if "://" in location else f"{parts.scheme}://{hostname}{location}")
+
+            # Correctly resolves absolute, protocol-relative ("//host/path"),
+            # and path-relative redirects against the current URL.
+            resolved = urljoin(current_url, location)
+            next_parts = urlsplit(resolved)
             next_host = next_parts.hostname
+
+            if next_parts.scheme not in ("http", "https"):
+                return False, None, f"redirect used disallowed scheme '{next_parts.scheme}'"
             if not _validate_host(next_host):
                 return False, None, f"redirect target host '{next_host}' not in allowlist"
             if not _host_resolves_safe(next_host):
                 return False, None, "redirect target resolves to a disallowed address"
-            current_url = location if "://" in location else f"{parts.scheme}://{next_host}{location}"
+
+            current_url = resolved
             parts = next_parts
             hostname = next_host
             continue
